@@ -8,7 +8,15 @@ WORKDIR /app
 COPY start-stream.sh /app/start-stream.sh
 RUN chmod +x /app/start-stream.sh
 
-# Your media files
-COPY video.mp4 /app/video.mp4
+# Copy raw video, pre-encode it, then delete the raw file
+COPY video.mp4 /tmp/video_raw.mp4
+RUN ffmpeg -i /tmp/video_raw.mp4 \
+       -c:v libx264 -preset slow \
+       -b:v 4500k -maxrate 6000k -bufsize 12000k \
+       -vf 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2' \
+       -pix_fmt yuv420p -r 30 -g 60 -keyint_min 60 \
+       -c:a aac -b:a 128k -ar 44100 \
+       /app/video.mp4 && \
+    rm /tmp/video_raw.mp4
 
 CMD ["/app/start-stream.sh"]
