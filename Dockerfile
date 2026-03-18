@@ -18,3 +18,7 @@ RUN ffmpeg -y -i /tmp/video_raw.mp4 \
        /app/video.mp4 \
     && rm /tmp/video_raw.mp4 \
     && ffprobe -v quiet -show_entries format=bit_rate -of default=noprint_wrappers=1 /app/video.mp4
+
+RUN echo "v2" > /app/version.txt
+
+CMD ["/app/start-stream.sh"]
