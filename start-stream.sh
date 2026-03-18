@@ -12,12 +12,10 @@ if [ -z "$STREAM_KEY" ]; then
   exit 1
 fi
 
-echo "Starting 1080p YouTube stream (WARNING: may stutter or suspend soon)..."
-
 ffmpeg -re -stream_loop -1 -i /app/video.mp4 \
        -c:v libx264 -preset veryfast -tune zerolatency \
        -b:v 1500k -maxrate 2000k -bufsize 4000k \
-       -vf scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2 \
+       -vf 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2' \
        -pix_fmt yuv420p -r 30 -g 60 -keyint_min 60 \
        -c:a aac -b:a 128k -ar 44100 \
        -f flv "rtmp://a.rtmp.youtube.com/live2/${STREAM_KEY}"
