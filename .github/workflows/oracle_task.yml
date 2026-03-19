@@ -146,7 +146,6 @@ jobs:
             echo ""
             echo "=== Attempt $((i+1))/3 in AD: $AD ==="
 
-            # === REAL ERROR CAPTURE (this was the bug before) ===
             set +e
             RESULT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
@@ -158,7 +157,6 @@ jobs:
               --subnet-id "$SUBNET_ID" \
               --assign-public-ip true \
               --boot-volume-size-in-gbs 200 \
-              --boot-volume-vpus-per-gb 10 \
               --is-pv-encryption-in-transit-enabled true \
               --ssh-authorized-keys-file /tmp/ssh_pub_key.pub \
               --agent-config "$AGENT" \
