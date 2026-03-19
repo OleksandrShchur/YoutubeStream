@@ -30,28 +30,15 @@ jobs:
             "$OCI_CLI_USER" "$OCI_CLI_TENANCY" "$OCI_CLI_FINGERPRINT" "$OCI_CLI_REGION" \
             > ~/.oci/config
 
-          # Suppress the common permissions warning for ALL future steps
           echo "OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True" >> $GITHUB_ENV
-          echo "Permissions warning suppressed globally."
 
-      - name: Debug OCI config + fix permissions
+      - name: Debug OCI config
         run: |
           echo "=== ~/.oci/config ==="
           cat ~/.oci/config
-          echo ""
-          echo "=== PEM key first and last line ==="
-          head -1 ~/.oci/oci_api_key.pem
-          tail -1 ~/.oci/oci_api_key.pem
-          echo ""
-          echo "=== OCI CLI version ==="
-          oci --version
-          echo ""
-          echo "=== Test auth (region list) ==="
-          oci iam region list 2>&1 | head -30
-          echo ""
-          echo "=== Fixing OCI CLI file permissions ==="
+          echo "=== Fixing permissions ==="
           oci setup repair-file-permissions --file ~/.oci/config || true
-          echo "Permissions repair completed."
+          echo "Permissions fixed."
 
       - name: Check for existing instance
         id: check
@@ -130,7 +117,7 @@ jobs:
             echo "pub_key=$STORED_KEY" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create OCI instance (try up to 3 ADs with full debug)
+      - name: Create OCI instance (try up to 3 ADs) - FIXED VERSION
         if: steps.check.outputs.exists == 'false'
         id: create
         continue-on-error: true
@@ -140,38 +127,27 @@ jobs:
           IMAGE_ID:       ${{ secrets.OCI_IMAGE_ID }}
         run: |
           PUB_KEY="${{ steps.ssh.outputs.pub_key }}"
-          if [ -z "$PUB_KEY" ]; then
-            PUB_KEY="${{ secrets.OCI_SSH_PUBLIC_KEY }}"
-          fi
+          if [ -z "$PUB_KEY" ]; then PUB_KEY="${{ secrets.OCI_SSH_PUBLIC_KEY }}"; fi
           echo "$PUB_KEY" > /tmp/ssh_pub_key.pub
 
           AGENT='{"isMonitoringDisabled":false,"isManagementDisabled":true,"pluginsConfig":[{"name":"Vulnerability Scanning","desiredState":"DISABLED"},{"name":"Management Agent","desiredState":"DISABLED"},{"name":"Custom Logs Monitoring","desiredState":"ENABLED"},{"name":"Compute RDMA GPU Monitoring","desiredState":"DISABLED"},{"name":"Compute Instance Monitoring","desiredState":"ENABLED"},{"name":"Compute HPC RDMA Auto-Configuration","desiredState":"DISABLED"},{"name":"Compute HPC RDMA Authentication","desiredState":"DISABLED"},{"name":"Cloud Guard Workload Protection","desiredState":"ENABLED"},{"name":"Block Volume Management","desiredState":"DISABLED"},{"name":"Bastion","desiredState":"DISABLED"}]}'
 
-          # === Fetch ADs reliably using jq (pre-installed on runner) ===
           echo "=== Fetching Availability Domains ==="
-          JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" --output json 2>&1)
-          if echo "$JSON" | grep -q "Error"; then
-            echo "ERROR fetching ADs: $JSON"
-            echo "success=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" --output json)
           mapfile -t AD_LIST < <(echo "$JSON" | jq -r '.data[].name // empty')
           echo "Found ${#AD_LIST[@]} AD(s): ${AD_LIST[*]}"
-          for i in "${!AD_LIST[@]}"; do
-            echo "   AD $i: ${AD_LIST[$i]}"
-          done
 
-          # Try up to first 3 ADs
           SUCCESS=false
           INSTANCE_ID=""
 
           for i in "${!AD_LIST[@]}"; do
-            if [ $i -ge 3 ]; then break; fi
+            [ $i -ge 3 ] && break
             AD="${AD_LIST[$i]}"
             echo ""
             echo "=== Attempt $((i+1))/3 in AD: $AD ==="
 
-            # Prevent 'set -e' from killing the script on failure
+            # === REAL ERROR CAPTURE (this was the bug before) ===
+            set +e
             RESULT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
               --display-name "instance-20260319-1131" \
@@ -187,19 +163,12 @@ jobs:
               --ssh-authorized-keys-file /tmp/ssh_pub_key.pub \
               --agent-config "$AGENT" \
               --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
-              2>&1) || true
-
+              2>&1)
             EXIT_CODE=$?
+            set -e
 
             if [ $EXIT_CODE -eq 0 ]; then
-              INSTANCE_ID=$(echo "$RESULT" | python3 -c "
-                import sys, json
-                try:
-                    data = json.load(sys.stdin)
-                    print(data.get('data', {}).get('id', 'unknown'))
-                except:
-                    print('unknown')
-                " 2>/dev/null || echo "unknown")
+              INSTANCE_ID=$(echo "$RESULT" | jq -r '.data.id // "unknown"')
               echo "✅ SUCCESS! Instance created in $AD"
               echo "Instance ID: $INSTANCE_ID"
               SUCCESS=true
@@ -208,40 +177,29 @@ jobs:
               echo "❌ Failed in $AD (exit code $EXIT_CODE)"
               echo "$RESULT"
               echo ""
-
-              # Human-readable error explanations
-              if echo "$RESULT" | grep -qi "out of host capacity\|outofhostcapacity"; then
-                echo "→ OUT OF HOST CAPACITY (most common free-tier A1 issue)"
-                echo "   Oracle has no ARM hosts available in this AD right now."
+              if echo "$RESULT" | grep -qi "out of host capacity"; then
+                echo "→ OUT OF HOST CAPACITY (Chicago region is full right now)"
               elif echo "$RESULT" | grep -qi "LimitExceeded\|quota"; then
-                echo "→ LIMIT EXCEEDED (check boot volumes + A1 core quota in console)"
-              elif echo "$RESULT" | grep -qi "NotAuthorizedOrNotFound\|404"; then
-                echo "→ PERMISSION OR NOT FOUND (check policies / OCIDs)"
-              elif echo "$RESULT" | grep -qi "InvalidParameter"; then
-                echo "→ INVALID PARAMETER (wrong image/shape/subnet/AD)"
+                echo "→ QUOTA EXCEEDED (check boot volumes in console)"
               else
-                echo "→ Unknown error - see full output above"
+                echo "→ See full error above"
               fi
             fi
           done
 
-          # Set outputs for next steps
           echo "success=$SUCCESS" >> $GITHUB_OUTPUT
           [ "$SUCCESS" = "true" ] && echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
           if [ "$SUCCESS" = "false" ]; then
-            echo "❌ Creation failed in all 3 ADs - will retry in 5 minutes."
+            echo "❌ All 3 ADs failed - will retry in 5 min."
           fi
 
       - name: Disable workflow on success
-        if: |
-          steps.check.outputs.exists == 'true' ||
-          steps.create.outputs.success == 'true'
+        if: steps.check.outputs.exists == 'true' || steps.create.outputs.success == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          REPO:     ${{ github.repository }}
+          REPO: ${{ github.repository }}
         run: |
-          WORKFLOW_ID=$(gh api repos/$REPO/actions/workflows \
-            --jq '.workflows[] | select(.name == "OCI Create Instance") | .id')
+          WORKFLOW_ID=$(gh api repos/$REPO/actions/workflows --jq '.workflows[] | select(.name == "OCI Create Instance") | .id')
           gh api --method PUT repos/$REPO/actions/workflows/$WORKFLOW_ID/disable
-          echo "Workflow disabled - instance is running, no more retries needed."
+          echo "Workflow disabled - instance is running."
