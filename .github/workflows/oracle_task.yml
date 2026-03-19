@@ -40,6 +40,21 @@ jobs:
           oci setup repair-file-permissions --file ~/.oci/config || true
           echo "Permissions fixed."
 
+      - name: Validate resources
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          SUBNET_ID:      ${{ secrets.OCI_SUBNET_ID }}
+          IMAGE_ID:       ${{ secrets.OCI_IMAGE_ID }}
+        run: |
+          echo "=== Validating IMAGE_ID ==="
+          oci compute image get --image-id "$IMAGE_ID" 2>&1 | head -10
+
+          echo "=== Validating SUBNET_ID ==="
+          oci network subnet get --subnet-id "$SUBNET_ID" 2>&1 | head -10
+
+          echo "=== Validating COMPARTMENT_ID ==="
+          oci iam compartment get --compartment-id "$COMPARTMENT_ID" 2>&1 | head -10
+
       - name: Check for existing instance
         id: check
         run: |
@@ -117,7 +132,7 @@ jobs:
             echo "pub_key=$STORED_KEY" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create OCI instance (try up to 3 ADs) - FIXED VERSION
+      - name: Create OCI instance (try up to 3 ADs)
         if: steps.check.outputs.exists == 'false'
         id: create
         continue-on-error: true
