@@ -30,7 +30,7 @@ jobs:
             "$OCI_CLI_USER" "$OCI_CLI_TENANCY" "$OCI_CLI_FINGERPRINT" "$OCI_CLI_REGION" \
             > ~/.oci/config
 
-      - name: Debug OCI config
+      - name: Debug OCI config + suppress permissions warning
         run: |
           echo "=== ~/.oci/config ==="
           cat ~/.oci/config
@@ -45,8 +45,14 @@ jobs:
           echo "=== Test auth (region list) ==="
           oci iam region list 2>&1 | head -30
           echo ""
-          echo "=== AD name secret value ==="
+          echo "=== AD name secret value (for reference) ==="
           echo "AD=${{ secrets.OCI_AD_NAME }}"
+
+          # Fix the common "Permissions on config are too open" warning
+          echo "=== Fixing OCI CLI file permissions ==="
+          oci setup repair-file-permissions --file ~/.oci/config --force || true
+          echo "OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True" >> $GITHUB_ENV
+          echo "Permissions warning suppressed for all future steps."
 
       - name: Check for existing instance
         id: check
@@ -125,57 +131,102 @@ jobs:
             echo "pub_key=$STORED_KEY" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create OCI instance
+      - name: Create OCI instance (try up to 3 ADs)
         if: steps.check.outputs.exists == 'false'
         id: create
         continue-on-error: true
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          SUBNET_ID:      ${{ secrets.OCI_SUBNET_ID }}
+          IMAGE_ID:       ${{ secrets.OCI_IMAGE_ID }}
         run: |
-          COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
-          SUBNET_ID="${{ secrets.OCI_SUBNET_ID }}"
-          IMAGE_ID="${{ secrets.OCI_IMAGE_ID }}"
-          AD="${{ secrets.OCI_AD_NAME }}"
-
           PUB_KEY="${{ steps.ssh.outputs.pub_key }}"
           if [ -z "$PUB_KEY" ]; then
             PUB_KEY="${{ secrets.OCI_SSH_PUBLIC_KEY }}"
           fi
           echo "$PUB_KEY" > /tmp/ssh_pub_key.pub
 
-          echo "Attempting to create instance..."
-          echo "Using AD: $AD"
-
           AGENT='{"isMonitoringDisabled":false,"isManagementDisabled":true,"pluginsConfig":[{"name":"Vulnerability Scanning","desiredState":"DISABLED"},{"name":"Management Agent","desiredState":"DISABLED"},{"name":"Custom Logs Monitoring","desiredState":"ENABLED"},{"name":"Compute RDMA GPU Monitoring","desiredState":"DISABLED"},{"name":"Compute Instance Monitoring","desiredState":"ENABLED"},{"name":"Compute HPC RDMA Auto-Configuration","desiredState":"DISABLED"},{"name":"Compute HPC RDMA Authentication","desiredState":"DISABLED"},{"name":"Cloud Guard Workload Protection","desiredState":"ENABLED"},{"name":"Block Volume Management","desiredState":"DISABLED"},{"name":"Bastion","desiredState":"DISABLED"}]}'
 
-          RESULT=$(oci compute instance launch \
+          # Get all Availability Domains (fresh every run)
+          echo "=== Fetching Availability Domains ==="
+          AD_LIST=($(oci iam availability-domain list \
             --compartment-id "$COMPARTMENT_ID" \
-            --display-name "instance-20260319-1131" \
-            --availability-domain "$AD" \
-            --shape "VM.Standard.A1.Flex" \
-            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
-            --image-id "$IMAGE_ID" \
-            --subnet-id "$SUBNET_ID" \
-            --assign-public-ip true \
-            --boot-volume-size-in-gbs 200 \
-            --boot-volume-vpus-per-gb 10 \
-            --is-pv-encryption-in-transit-enabled true \
-            --ssh-authorized-keys-file /tmp/ssh_pub_key.pub \
-            --agent-config "$AGENT" \
-            --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
-            2>&1)
+            --query "data[*].name" \
+            --raw-output))
+          echo "Found ${#AD_LIST[@]} AD(s): ${AD_LIST[*]}"
 
-          EXIT_CODE=$?
+          # Try up to first 3 ADs
+          SUCCESS=false
+          INSTANCE_ID=""
 
-          if [ $EXIT_CODE -eq 0 ]; then
-            INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
-            echo "Instance created! ID: $INSTANCE_ID"
-            echo "success=true" >> $GITHUB_OUTPUT
+          for i in "${!AD_LIST[@]}"; do
+            if [ $i -ge 3 ]; then break; fi
+            AD="${AD_LIST[$i]}"
+            echo ""
+            echo "=== Attempt $((i+1))/3 in AD: $AD ==="
+
+            RESULT=$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --display-name "instance-20260319-1131" \
+              --availability-domain "$AD" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --image-id "$IMAGE_ID" \
+              --subnet-id "$SUBNET_ID" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 200 \
+              --boot-volume-vpus-per-gb 10 \
+              --is-pv-encryption-in-transit-enabled true \
+              --ssh-authorized-keys-file /tmp/ssh_pub_key.pub \
+              --agent-config "$AGENT" \
+              --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
+              2>&1)
+
+            EXIT_CODE=$?
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              INSTANCE_ID=$(echo "$RESULT" | python3 -c "
+                import sys, json
+                try:
+                    data = json.load(sys.stdin)
+                    print(data.get('data', {}).get('id', 'unknown'))
+                except:
+                    print('unknown')
+                " 2>/dev/null || echo "unknown")
+              echo "✅ SUCCESS! Instance created in $AD"
+              echo "Instance ID: $INSTANCE_ID"
+              SUCCESS=true
+              break
+            else
+              echo "❌ Failed in $AD (exit code $EXIT_CODE)"
+              echo "$RESULT"
+              echo ""
+
+              # Friendly explanation of common errors
+              if echo "$RESULT" | grep -qi "out of host capacity\|outofhostcapacity"; then
+                echo "→ OUT OF HOST CAPACITY (most common A1.Flex free-tier issue)"
+                echo "   Oracle has no free ARM hosts in this AD right now."
+              elif echo "$RESULT" | grep -qi "LimitExceeded\|quota"; then
+                echo "→ LIMIT EXCEEDED (check your boot volumes and A1 core quota)"
+              elif echo "$RESULT" | grep -qi "NotAuthorizedOrNotFound\|404"; then
+                echo "→ PERMISSION OR NOT FOUND error (check policies or OCIDs)"
+              elif echo "$RESULT" | grep -qi "InvalidParameter"; then
+                echo "→ INVALID PARAMETER (wrong image/shape/subnet/AD combo)"
+              else
+                echo "→ Unknown error - see full output above"
+              fi
+            fi
+          done
+
+          # Set outputs for later steps
+          echo "success=$SUCCESS" >> $GITHUB_OUTPUT
+          if [ "$SUCCESS" = "true" ]; then
             echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          else
-            echo "Creation failed - will retry in 5 minutes."
-            echo "---- OCI error output ----"
-            echo "$RESULT"
-            echo "--------------------------"
-            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "$SUCCESS" = "false" ]; then
+            echo "❌ Creation failed in all 3 ADs - will retry in 5 minutes."
           fi
 
       - name: Disable workflow on success
