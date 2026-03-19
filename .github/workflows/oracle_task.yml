@@ -26,100 +26,98 @@ jobs:
           OCI_CLI_REGION:      ${{ secrets.OCI_CLI_REGION }}
         run: |
           mkdir -p ~/.oci
-          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          printf '%s' "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
 
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=$OCI_CLI_USER
-          tenancy=$OCI_CLI_TENANCY
-          fingerprint=$OCI_CLI_FINGERPRINT
-          key_file=~/.oci/oci_api_key.pem
-          region=$OCI_CLI_REGION
-          EOF
+          cat > ~/.oci/config << EOF
+        [DEFAULT]
+        user=$OCI_CLI_USER
+        tenancy=$OCI_CLI_TENANCY
+        fingerprint=$OCI_CLI_FINGERPRINT
+        key_file=/home/runner/.oci/oci_api_key.pem
+        region=$OCI_CLI_REGION
+        EOF
 
-      # ── 3. Check if instance already exists ─────────────────────────────
-      - name: Check for existing instance
-        id: check
-        env:
-          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
-        run: |
-          COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
+            # ── 3. Check if instance already exists ─────────────────────────────
+            - name: Check for existing instance
+                id: check
+                run: |
+                COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
 
-          EXISTING=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --display-name   "instance-20260319-1131" \
-            --lifecycle-state RUNNING \
-            --query "data[0].id" \
-            --raw-output 2>/dev/null || echo "")
+                EXISTING=$(oci compute instance list \
+                    --compartment-id "$COMPARTMENT_ID" \
+                    --display-name   "instance-20260319-1131" \
+                    --lifecycle-state RUNNING \
+                    --query "data[0].id" \
+                    --raw-output 2>/dev/null || echo "")
 
-          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-            echo "✅ Instance already running: $EXISTING"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "No running instance found — will attempt creation."
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
+                if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+                    echo "✅ Instance already running: $EXISTING"
+                    echo "exists=true" >> $GITHUB_OUTPUT
+                else
+                    echo "No running instance found — will attempt creation."
+                    echo "exists=false" >> $GITHUB_OUTPUT
+                fi
 
-      # ── 4. Generate SSH key pair (only on first run) ─────────────────────
-      - name: Generate SSH key pair
-        if: steps.check.outputs.exists == 'false'
-        id: ssh
-        env:
-          GH_TOKEN:   ${{ secrets.GH_PAT }}
-          REPO:       ${{ github.repository }}
-          STORED_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-        run: |
-          if [ -z "$STORED_KEY" ]; then
-            echo "Generating new SSH key pair..."
-            ssh-keygen -t rsa -b 4096 -f ~/.ssh/oci_instance_key -N "" -C "oci-instance-auto"
+            # ── 4. Generate SSH key pair (only on first run) ─────────────────────
+            - name: Generate or reuse SSH key pair
+                if: steps.check.outputs.exists == 'false'
+                id: ssh
+                env:
+                GH_TOKEN:   ${{ secrets.GH_PAT }}
+                REPO:       ${{ github.repository }}
+                STORED_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+                run: |
+                if [ -z "$STORED_KEY" ]; then
+                    echo "Generating new SSH key pair..."
+                    ssh-keygen -t rsa -b 4096 -f ~/.ssh/oci_instance_key -N "" -C "oci-instance-auto"
 
-            pip install PyNaCl --quiet
+                    pip install PyNaCl --quiet
 
-            python3 - <<PYEOF
-          import base64, json, os, urllib.request
-          from nacl import encoding, public as nacl_public
+                    python3 - <<PYEOF
+                    import base64, json, os, urllib.request
+                    from nacl import encoding, public as nacl_public
 
-          token  = os.environ["GH_TOKEN"]
-          repo   = os.environ["REPO"]
-          api    = f"https://api.github.com/repos/{repo}/actions"
+                    token  = os.environ["GH_TOKEN"]
+                    repo   = os.environ["REPO"]
+                    api    = f"https://api.github.com/repos/{repo}/actions"
 
-          def get_pub_key():
-              req = urllib.request.Request(f"{api}/secrets/public-key",
-                    headers={"Authorization": f"Bearer {token}",
-                             "X-GitHub-Api-Version": "2022-11-28"})
-              with urllib.request.urlopen(req) as r:
-                  return json.loads(r.read())
+                    def get_pub_key():
+                        req = urllib.request.Request(f"{api}/secrets/public-key",
+                            headers={"Authorization": f"Bearer {token}",
+                                    "X-GitHub-Api-Version": "2022-11-28"})
+                        with urllib.request.urlopen(req) as r:
+                            return json.loads(r.read())
 
-          def encrypt(pub_key_b64, secret_value):
-              pub_key_bytes = base64.b64decode(pub_key_b64)
-              box = nacl_public.SealedBox(nacl_public.PublicKey(pub_key_bytes))
-              encrypted = box.encrypt(secret_value.encode())
-              return base64.b64encode(encrypted).decode()
+                    def encrypt(pub_key_b64, secret_value):
+                        pub_key_bytes = base64.b64decode(pub_key_b64)
+                        box = nacl_public.SealedBox(nacl_public.PublicKey(pub_key_bytes))
+                        encrypted = box.encrypt(secret_value.encode())
+                        return base64.b64encode(encrypted).decode()
 
-          def save_secret(name, value, key_id, pub_key_b64):
-              encrypted = encrypt(pub_key_b64, value)
-              body = json.dumps({"encrypted_value": encrypted, "key_id": key_id}).encode()
-              req = urllib.request.Request(f"{api}/secrets/{name}", data=body, method="PUT",
-                    headers={"Authorization": f"Bearer {token}",
-                             "Content-Type": "application/json",
-                             "X-GitHub-Api-Version": "2022-11-28"})
-              with urllib.request.urlopen(req) as r:
-                  print(f"Saved secret {name}: HTTP {r.status}")
+                    def save_secret(name, value, key_id, pub_key_b64):
+                        encrypted = encrypt(pub_key_b64, value)
+                        body = json.dumps({"encrypted_value": encrypted, "key_id": key_id}).encode()
+                        req = urllib.request.Request(f"{api}/secrets/{name}", data=body, method="PUT",
+                            headers={"Authorization": f"Bearer {token}",
+                                    "Content-Type": "application/json",
+                                    "X-GitHub-Api-Version": "2022-11-28"})
+                        with urllib.request.urlopen(req) as r:
+                            print(f"Saved secret {name}: HTTP {r.status}")
 
-          key_info = get_pub_key()
-          key_id   = key_info["key_id"]
-          pub_b64  = key_info["key"]
+                    key_info = get_pub_key()
+                    key_id   = key_info["key_id"]
+                    pub_b64  = key_info["key"]
 
-          with open(os.path.expanduser("~/.ssh/oci_instance_key.pub")) as f:
-              pub = f.read().strip()
-          with open(os.path.expanduser("~/.ssh/oci_instance_key")) as f:
-              priv = f.read()
+                    with open(os.path.expanduser("~/.ssh/oci_instance_key.pub")) as f:
+                        pub = f.read().strip()
+                    with open(os.path.expanduser("~/.ssh/oci_instance_key")) as f:
+                        priv = f.read()
 
-          save_secret("OCI_SSH_PUBLIC_KEY",  pub,  key_id, pub_b64)
-          save_secret("OCI_SSH_PRIVATE_KEY", priv, key_id, pub_b64)
-          print("Both keys saved to GitHub Secrets.")
-          PYEOF
+                    save_secret("OCI_SSH_PUBLIC_KEY",  pub,  key_id, pub_b64)
+                    save_secret("OCI_SSH_PRIVATE_KEY", priv, key_id, pub_b64)
+                    print("Both keys saved to GitHub Secrets.")
+                    PYEOF
 
             PUB_KEY=$(cat ~/.ssh/oci_instance_key.pub)
             echo "pub_key=$PUB_KEY" >> $GITHUB_OUTPUT
@@ -132,13 +130,12 @@ jobs:
       - name: Create OCI instance
         if: steps.check.outputs.exists == 'false'
         id: create
-        env:
-          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+        continue-on-error: true   # don't mark workflow as failed on capacity errors
         run: |
           COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
           SUBNET_ID="${{ secrets.OCI_SUBNET_ID }}"
           IMAGE_ID="${{ secrets.OCI_IMAGE_ID }}"
-          AD="${{ secrets.OCI_CLI_REGION }}-AD-1"
+          AD="${{ secrets.OCI_AD_NAME }}"
 
           PUB_KEY="${{ steps.ssh.outputs.pub_key }}"
           if [ -z "$PUB_KEY" ]; then
@@ -147,6 +144,7 @@ jobs:
           echo "$PUB_KEY" > /tmp/ssh_pub_key.pub
 
           echo "Attempting to create instance..."
+          echo "Using AD: $AD"
 
           RESULT=$(oci compute instance launch \
             --compartment-id          "$COMPARTMENT_ID" \
@@ -185,11 +183,13 @@ jobs:
           if [ $EXIT_CODE -eq 0 ]; then
             INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
             echo "✅ Instance created! ID: $INSTANCE_ID"
-            echo "success=true"        >> $GITHUB_OUTPUT
+            echo "success=true"            >> $GITHUB_OUTPUT
             echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           else
-            echo "⚠️  Creation failed (likely out-of-capacity) — will retry in 5 minutes."
+            echo "⚠️  Creation failed — will retry in 5 minutes."
+            echo "---- OCI error output ----"
             echo "$RESULT"
+            echo "--------------------------"
             echo "success=false" >> $GITHUB_OUTPUT
           fi
 
