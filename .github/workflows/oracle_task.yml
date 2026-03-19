@@ -30,7 +30,11 @@ jobs:
             "$OCI_CLI_USER" "$OCI_CLI_TENANCY" "$OCI_CLI_FINGERPRINT" "$OCI_CLI_REGION" \
             > ~/.oci/config
 
-      - name: Debug OCI config + suppress permissions warning
+          # Suppress the common permissions warning for ALL future steps
+          echo "OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True" >> $GITHUB_ENV
+          echo "Permissions warning suppressed globally."
+
+      - name: Debug OCI config + fix permissions
         run: |
           echo "=== ~/.oci/config ==="
           cat ~/.oci/config
@@ -45,14 +49,9 @@ jobs:
           echo "=== Test auth (region list) ==="
           oci iam region list 2>&1 | head -30
           echo ""
-          echo "=== AD name secret value (for reference) ==="
-          echo "AD=${{ secrets.OCI_AD_NAME }}"
-
-          # Fix the common "Permissions on config are too open" warning
           echo "=== Fixing OCI CLI file permissions ==="
-          oci setup repair-file-permissions --file ~/.oci/config --force || true
-          echo "OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True" >> $GITHUB_ENV
-          echo "Permissions warning suppressed for all future steps."
+          oci setup repair-file-permissions --file ~/.oci/config || true
+          echo "Permissions repair completed."
 
       - name: Check for existing instance
         id: check
@@ -131,7 +130,7 @@ jobs:
             echo "pub_key=$STORED_KEY" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create OCI instance (try up to 3 ADs)
+      - name: Create OCI instance (try up to 3 ADs with full debug)
         if: steps.check.outputs.exists == 'false'
         id: create
         continue-on-error: true
@@ -148,13 +147,19 @@ jobs:
 
           AGENT='{"isMonitoringDisabled":false,"isManagementDisabled":true,"pluginsConfig":[{"name":"Vulnerability Scanning","desiredState":"DISABLED"},{"name":"Management Agent","desiredState":"DISABLED"},{"name":"Custom Logs Monitoring","desiredState":"ENABLED"},{"name":"Compute RDMA GPU Monitoring","desiredState":"DISABLED"},{"name":"Compute Instance Monitoring","desiredState":"ENABLED"},{"name":"Compute HPC RDMA Auto-Configuration","desiredState":"DISABLED"},{"name":"Compute HPC RDMA Authentication","desiredState":"DISABLED"},{"name":"Cloud Guard Workload Protection","desiredState":"ENABLED"},{"name":"Block Volume Management","desiredState":"DISABLED"},{"name":"Bastion","desiredState":"DISABLED"}]}'
 
-          # Get all Availability Domains (fresh every run)
+          # === Fetch ADs reliably using jq (pre-installed on runner) ===
           echo "=== Fetching Availability Domains ==="
-          AD_LIST=($(oci iam availability-domain list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --query "data[*].name" \
-            --raw-output))
+          JSON=$(oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" --output json 2>&1)
+          if echo "$JSON" | grep -q "Error"; then
+            echo "ERROR fetching ADs: $JSON"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          mapfile -t AD_LIST < <(echo "$JSON" | jq -r '.data[].name // empty')
           echo "Found ${#AD_LIST[@]} AD(s): ${AD_LIST[*]}"
+          for i in "${!AD_LIST[@]}"; do
+            echo "   AD $i: ${AD_LIST[$i]}"
+          done
 
           # Try up to first 3 ADs
           SUCCESS=false
@@ -166,6 +171,7 @@ jobs:
             echo ""
             echo "=== Attempt $((i+1))/3 in AD: $AD ==="
 
+            # Prevent 'set -e' from killing the script on failure
             RESULT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
               --display-name "instance-20260319-1131" \
@@ -181,7 +187,7 @@ jobs:
               --ssh-authorized-keys-file /tmp/ssh_pub_key.pub \
               --agent-config "$AGENT" \
               --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
-              2>&1)
+              2>&1) || true
 
             EXIT_CODE=$?
 
@@ -203,27 +209,25 @@ jobs:
               echo "$RESULT"
               echo ""
 
-              # Friendly explanation of common errors
+              # Human-readable error explanations
               if echo "$RESULT" | grep -qi "out of host capacity\|outofhostcapacity"; then
-                echo "→ OUT OF HOST CAPACITY (most common A1.Flex free-tier issue)"
-                echo "   Oracle has no free ARM hosts in this AD right now."
+                echo "→ OUT OF HOST CAPACITY (most common free-tier A1 issue)"
+                echo "   Oracle has no ARM hosts available in this AD right now."
               elif echo "$RESULT" | grep -qi "LimitExceeded\|quota"; then
-                echo "→ LIMIT EXCEEDED (check your boot volumes and A1 core quota)"
+                echo "→ LIMIT EXCEEDED (check boot volumes + A1 core quota in console)"
               elif echo "$RESULT" | grep -qi "NotAuthorizedOrNotFound\|404"; then
-                echo "→ PERMISSION OR NOT FOUND error (check policies or OCIDs)"
+                echo "→ PERMISSION OR NOT FOUND (check policies / OCIDs)"
               elif echo "$RESULT" | grep -qi "InvalidParameter"; then
-                echo "→ INVALID PARAMETER (wrong image/shape/subnet/AD combo)"
+                echo "→ INVALID PARAMETER (wrong image/shape/subnet/AD)"
               else
                 echo "→ Unknown error - see full output above"
               fi
             fi
           done
 
-          # Set outputs for later steps
+          # Set outputs for next steps
           echo "success=$SUCCESS" >> $GITHUB_OUTPUT
-          if [ "$SUCCESS" = "true" ]; then
-            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          fi
+          [ "$SUCCESS" = "true" ] && echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
           if [ "$SUCCESS" = "false" ]; then
             echo "❌ Creation failed in all 3 ADs - will retry in 5 minutes."
