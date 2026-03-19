@@ -2,21 +2,19 @@ name: OCI Create Instance
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes
-  workflow_dispatch:          # allow manual trigger too
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   create-instance:
     runs-on: ubuntu-latest
     permissions:
-      actions: write   # needed to disable the workflow on success
+      actions: write
 
     steps:
-      # ── 1. Install OCI CLI ───────────────────────────────────────────────
       - name: Install OCI CLI
         run: pip install oci-cli --quiet
 
-      # ── 2. Configure OCI credentials ────────────────────────────────────
       - name: Configure OCI credentials
         env:
           OCI_CLI_USER:        ${{ secrets.OCI_CLI_USER }}
@@ -28,109 +26,91 @@ jobs:
           mkdir -p ~/.oci
           printf '%s' "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
+          printf '[DEFAULT]\nuser=%s\ntenancy=%s\nfingerprint=%s\nkey_file=/home/runner/.oci/oci_api_key.pem\nregion=%s\n' \
+            "$OCI_CLI_USER" "$OCI_CLI_TENANCY" "$OCI_CLI_FINGERPRINT" "$OCI_CLI_REGION" \
+            > ~/.oci/config
 
-          cat > ~/.oci/config << EOF
-        [DEFAULT]
-        user=$OCI_CLI_USER
-        tenancy=$OCI_CLI_TENANCY
-        fingerprint=$OCI_CLI_FINGERPRINT
-        key_file=/home/runner/.oci/oci_api_key.pem
-        region=$OCI_CLI_REGION
-        EOF
+      - name: Check for existing instance
+        id: check
+        run: |
+          COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
+          EXISTING=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "instance-20260319-1131" \
+            --lifecycle-state RUNNING \
+            --query "data[0].id" \
+            --raw-output 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "Instance already running: $EXISTING"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "No running instance found - will attempt creation."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
 
-            # ── 3. Check if instance already exists ─────────────────────────────
-            - name: Check for existing instance
-                id: check
-                run: |
-                COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
+      - name: Generate or reuse SSH key pair
+        if: steps.check.outputs.exists == 'false'
+        id: ssh
+        env:
+          GH_TOKEN:   ${{ secrets.GH_PAT }}
+          REPO:       ${{ github.repository }}
+          STORED_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          if [ -z "$STORED_KEY" ]; then
+            echo "Generating new SSH key pair..."
+            ssh-keygen -t rsa -b 4096 -f ~/.ssh/oci_instance_key -N "" -C "oci-instance-auto"
+            pip install PyNaCl --quiet
 
-                EXISTING=$(oci compute instance list \
-                    --compartment-id "$COMPARTMENT_ID" \
-                    --display-name   "instance-20260319-1131" \
-                    --lifecycle-state RUNNING \
-                    --query "data[0].id" \
-                    --raw-output 2>/dev/null || echo "")
+            python3 -c "
+          import base64, json, os, urllib.request
+          from nacl import public as nacl_public
 
-                if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
-                    echo "✅ Instance already running: $EXISTING"
-                    echo "exists=true" >> $GITHUB_OUTPUT
-                else
-                    echo "No running instance found — will attempt creation."
-                    echo "exists=false" >> $GITHUB_OUTPUT
-                fi
+          token = os.environ['GH_TOKEN']
+          repo  = os.environ['REPO']
+          api   = 'https://api.github.com/repos/' + repo + '/actions'
 
-            # ── 4. Generate SSH key pair (only on first run) ─────────────────────
-            - name: Generate or reuse SSH key pair
-                if: steps.check.outputs.exists == 'false'
-                id: ssh
-                env:
-                GH_TOKEN:   ${{ secrets.GH_PAT }}
-                REPO:       ${{ github.repository }}
-                STORED_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
-                run: |
-                if [ -z "$STORED_KEY" ]; then
-                    echo "Generating new SSH key pair..."
-                    ssh-keygen -t rsa -b 4096 -f ~/.ssh/oci_instance_key -N "" -C "oci-instance-auto"
+          def get_pub_key():
+              req = urllib.request.Request(api + '/secrets/public-key',
+                    headers={'Authorization': 'Bearer ' + token,
+                             'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
 
-                    pip install PyNaCl --quiet
+          def encrypt(pub_key_b64, secret_value):
+              pub_key_bytes = base64.b64decode(pub_key_b64)
+              box = nacl_public.SealedBox(nacl_public.PublicKey(pub_key_bytes))
+              return base64.b64encode(box.encrypt(secret_value.encode())).decode()
 
-                    python3 - <<PYEOF
-                    import base64, json, os, urllib.request
-                    from nacl import encoding, public as nacl_public
+          def save_secret(name, value, key_id, pub_key_b64):
+              body = json.dumps({'encrypted_value': encrypt(pub_key_b64, value), 'key_id': key_id}).encode()
+              req = urllib.request.Request(api + '/secrets/' + name, data=body, method='PUT',
+                    headers={'Authorization': 'Bearer ' + token,
+                             'Content-Type': 'application/json',
+                             'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.urlopen(req) as r:
+                  print('Saved secret ' + name + ': HTTP ' + str(r.status))
 
-                    token  = os.environ["GH_TOKEN"]
-                    repo   = os.environ["REPO"]
-                    api    = f"https://api.github.com/repos/{repo}/actions"
-
-                    def get_pub_key():
-                        req = urllib.request.Request(f"{api}/secrets/public-key",
-                            headers={"Authorization": f"Bearer {token}",
-                                    "X-GitHub-Api-Version": "2022-11-28"})
-                        with urllib.request.urlopen(req) as r:
-                            return json.loads(r.read())
-
-                    def encrypt(pub_key_b64, secret_value):
-                        pub_key_bytes = base64.b64decode(pub_key_b64)
-                        box = nacl_public.SealedBox(nacl_public.PublicKey(pub_key_bytes))
-                        encrypted = box.encrypt(secret_value.encode())
-                        return base64.b64encode(encrypted).decode()
-
-                    def save_secret(name, value, key_id, pub_key_b64):
-                        encrypted = encrypt(pub_key_b64, value)
-                        body = json.dumps({"encrypted_value": encrypted, "key_id": key_id}).encode()
-                        req = urllib.request.Request(f"{api}/secrets/{name}", data=body, method="PUT",
-                            headers={"Authorization": f"Bearer {token}",
-                                    "Content-Type": "application/json",
-                                    "X-GitHub-Api-Version": "2022-11-28"})
-                        with urllib.request.urlopen(req) as r:
-                            print(f"Saved secret {name}: HTTP {r.status}")
-
-                    key_info = get_pub_key()
-                    key_id   = key_info["key_id"]
-                    pub_b64  = key_info["key"]
-
-                    with open(os.path.expanduser("~/.ssh/oci_instance_key.pub")) as f:
-                        pub = f.read().strip()
-                    with open(os.path.expanduser("~/.ssh/oci_instance_key")) as f:
-                        priv = f.read()
-
-                    save_secret("OCI_SSH_PUBLIC_KEY",  pub,  key_id, pub_b64)
-                    save_secret("OCI_SSH_PRIVATE_KEY", priv, key_id, pub_b64)
-                    print("Both keys saved to GitHub Secrets.")
-                    PYEOF
+          key_info = get_pub_key()
+          with open(os.path.expanduser('~/.ssh/oci_instance_key.pub')) as f:
+              pub = f.read().strip()
+          with open(os.path.expanduser('~/.ssh/oci_instance_key')) as f:
+              priv = f.read()
+          save_secret('OCI_SSH_PUBLIC_KEY',  pub,  key_info['key_id'], key_info['key'])
+          save_secret('OCI_SSH_PRIVATE_KEY', priv, key_info['key_id'], key_info['key'])
+          print('Both keys saved to GitHub Secrets.')
+          "
 
             PUB_KEY=$(cat ~/.ssh/oci_instance_key.pub)
             echo "pub_key=$PUB_KEY" >> $GITHUB_OUTPUT
           else
-            echo "SSH key already exists in secrets, reusing it."
+            echo "SSH key already exists, reusing it."
             echo "pub_key=$STORED_KEY" >> $GITHUB_OUTPUT
           fi
 
-      # ── 5. Create the OCI instance ───────────────────────────────────────
       - name: Create OCI instance
         if: steps.check.outputs.exists == 'false'
         id: create
-        continue-on-error: true   # don't mark workflow as failed on capacity errors
+        continue-on-error: true
         run: |
           COMPARTMENT_ID="${{ secrets.OCI_COMPARTMENT_ID }}"
           SUBNET_ID="${{ secrets.OCI_SUBNET_ID }}"
@@ -146,54 +126,40 @@ jobs:
           echo "Attempting to create instance..."
           echo "Using AD: $AD"
 
+          AGENT='{"isMonitoringDisabled":false,"isManagementDisabled":true,"pluginsConfig":[{"name":"Vulnerability Scanning","desiredState":"DISABLED"},{"name":"Management Agent","desiredState":"DISABLED"},{"name":"Custom Logs Monitoring","desiredState":"ENABLED"},{"name":"Compute RDMA GPU Monitoring","desiredState":"DISABLED"},{"name":"Compute Instance Monitoring","desiredState":"ENABLED"},{"name":"Compute HPC RDMA Auto-Configuration","desiredState":"DISABLED"},{"name":"Compute HPC RDMA Authentication","desiredState":"DISABLED"},{"name":"Cloud Guard Workload Protection","desiredState":"ENABLED"},{"name":"Block Volume Management","desiredState":"DISABLED"},{"name":"Bastion","desiredState":"DISABLED"}]}'
+
           RESULT=$(oci compute instance launch \
-            --compartment-id          "$COMPARTMENT_ID" \
-            --display-name            "instance-20260319-1131" \
-            --availability-domain     "$AD" \
-            --shape                   "VM.Standard.A1.Flex" \
-            --shape-config            '{"ocpus": 4, "memoryInGBs": 24}' \
-            --image-id                "$IMAGE_ID" \
-            --subnet-id               "$SUBNET_ID" \
-            --assign-public-ip        true \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "instance-20260319-1131" \
+            --availability-domain "$AD" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+            --image-id "$IMAGE_ID" \
+            --subnet-id "$SUBNET_ID" \
+            --assign-public-ip true \
             --boot-volume-size-in-gbs 200 \
             --boot-volume-vpus-per-gb 10 \
             --is-pv-encryption-in-transit-enabled true \
             --ssh-authorized-keys-file /tmp/ssh_pub_key.pub \
-            --agent-config '{
-              "isMonitoringDisabled": false,
-              "isManagementDisabled": true,
-              "pluginsConfig": [
-                {"name": "Vulnerability Scanning",              "desiredState": "DISABLED"},
-                {"name": "Management Agent",                    "desiredState": "DISABLED"},
-                {"name": "Custom Logs Monitoring",              "desiredState": "ENABLED"},
-                {"name": "Compute RDMA GPU Monitoring",         "desiredState": "DISABLED"},
-                {"name": "Compute Instance Monitoring",         "desiredState": "ENABLED"},
-                {"name": "Compute HPC RDMA Auto-Configuration", "desiredState": "DISABLED"},
-                {"name": "Compute HPC RDMA Authentication",     "desiredState": "DISABLED"},
-                {"name": "Cloud Guard Workload Protection",     "desiredState": "ENABLED"},
-                {"name": "Block Volume Management",             "desiredState": "DISABLED"},
-                {"name": "Bastion",                             "desiredState": "DISABLED"}
-              ]
-            }' \
-            --availability-config '{"recoveryAction": "RESTORE_INSTANCE"}' \
+            --agent-config "$AGENT" \
+            --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
             2>&1)
 
           EXIT_CODE=$?
 
           if [ $EXIT_CODE -eq 0 ]; then
             INSTANCE_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
-            echo "✅ Instance created! ID: $INSTANCE_ID"
-            echo "success=true"            >> $GITHUB_OUTPUT
+            echo "Instance created! ID: $INSTANCE_ID"
+            echo "success=true" >> $GITHUB_OUTPUT
             echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           else
-            echo "⚠️  Creation failed — will retry in 5 minutes."
+            echo "Creation failed - will retry in 5 minutes."
             echo "---- OCI error output ----"
             echo "$RESULT"
             echo "--------------------------"
             echo "success=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── 6. Disable this workflow once the instance is up ─────────────────
       - name: Disable workflow on success
         if: |
           steps.check.outputs.exists == 'true' ||
@@ -202,11 +168,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           REPO:     ${{ github.repository }}
         run: |
-          WORKFLOW_ID=$(gh api \
-            repos/$REPO/actions/workflows \
+          WORKFLOW_ID=$(gh api repos/$REPO/actions/workflows \
             --jq '.workflows[] | select(.name == "OCI Create Instance") | .id')
-
-          gh api --method PUT \
-            repos/$REPO/actions/workflows/$WORKFLOW_ID/disable
-
-          echo "🛑 Workflow disabled — instance is running, no more retries needed."
+          gh api --method PUT repos/$REPO/actions/workflows/$WORKFLOW_ID/disable
+          echo "Workflow disabled - instance is running, no more retries needed."
