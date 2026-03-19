@@ -30,6 +30,24 @@ jobs:
             "$OCI_CLI_USER" "$OCI_CLI_TENANCY" "$OCI_CLI_FINGERPRINT" "$OCI_CLI_REGION" \
             > ~/.oci/config
 
+      - name: Debug OCI config
+        run: |
+          echo "=== ~/.oci/config ==="
+          cat ~/.oci/config
+          echo ""
+          echo "=== PEM key first and last line ==="
+          head -1 ~/.oci/oci_api_key.pem
+          tail -1 ~/.oci/oci_api_key.pem
+          echo ""
+          echo "=== OCI CLI version ==="
+          oci --version
+          echo ""
+          echo "=== Test auth (region list) ==="
+          oci iam region list 2>&1 | head -30
+          echo ""
+          echo "=== AD name secret value ==="
+          echo "AD=${{ secrets.OCI_AD_NAME }}"
+
       - name: Check for existing instance
         id: check
         run: |
