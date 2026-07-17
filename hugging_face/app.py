@@ -3,50 +3,26 @@ import subprocess
 import time
 import json
 import threading
-import logging
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from werkzeug.utils import secure_filename
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = 'hf_stream_stable_v1'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 * 1024
 
+# /app/data is writable on Hugging Face Spaces (free tier has no persistent disk —
+# files are lost on container restart; upgrade to paid persistent-storage to keep them)
 BASE_DIR = '/app/data'
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'video_library')
 STATE_FILE = os.path.join(BASE_DIR, 'stream_state.json')
-FFMPEG_LOG_DIR = os.path.join(BASE_DIR, 'ffmpeg_logs')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(FFMPEG_LOG_DIR, exist_ok=True)
 
-# Restart ffmpeg before YouTube drops the session (~2–3 h observed with copy + high bitrate).
-PLANNED_RESTART_SEC = int(os.environ.get('PLANNED_RESTART_SEC', 2 * 3600))
-# Exponential backoff when ffmpeg dies quickly or with a non-zero exit code.
-BACKOFF_BASE_SEC = int(os.environ.get('BACKOFF_BASE_SEC', 5))
-BACKOFF_MAX_SEC = int(os.environ.get('BACKOFF_MAX_SEC', 1800))
-# Runs shorter than this after a crash count as a failure for backoff.
-MIN_HEALTHY_RUNTIME_SEC = int(os.environ.get('MIN_HEALTHY_RUNTIME_SEC', 60))
-# Long runs ended by YouTube still get a short reconnect pause (not full backoff).
-YOUTUBE_RECONNECT_SEC = int(os.environ.get('YOUTUBE_RECONNECT_SEC', 10))
-
-VIDEO_BITRATE = os.environ.get('VIDEO_BITRATE', '8000k')
-AUDIO_BITRATE = os.environ.get('AUDIO_BITRATE', '128k')
-X264_PRESET = os.environ.get('X264_PRESET', 'ultrafast')
-# copy = near-zero CPU. cap = ultrafast re-encode capped for YouTube (recommended).
-# reencode = full quality re-encode (high CPU).
-ENCODE_MODE = os.environ.get('ENCODE_MODE', 'cap').lower()
-
+# active_streams: { 'stream_key': { 'process': proc, 'filename': str, 'loop': bool } }
 active_streams = {}
 streams_lock = threading.Lock()
-monitor_thread = None
 
 
-# ── State persistence ──────────────────────────────────────────────────────────
+# State persistence
 
 def save_all_states():
     with streams_lock:
@@ -66,245 +42,73 @@ def load_all_states():
     return {}
 
 
-# ── FFmpeg helpers ─────────────────────────────────────────────────────────────
+# FFmpeg launcher
 
-def _log_path(stream_key):
-    return os.path.join(FFMPEG_LOG_DIR, f"ffmpeg_{stream_key[-8:]}.log")
-
-
-def _tail_file(path, lines=25):
-    try:
-        with open(path, 'rb') as f:
-            text = f.read().decode('utf-8', errors='replace')
-        return '\n'.join(text.splitlines()[-lines:])
-    except Exception:
-        return ''
-
-
-def _close_log_file(info):
-    try:
-        info['log_file'].close()
-    except Exception:
-        pass
-
-
-def _input_ts_args():
-    """Keep timestamps sane when looping MP4 → FLV with stream copy."""
-    return ['-fflags', '+genpts', '-avoid_negative_ts', 'make_zero']
-
-
-def _output_args():
-    if ENCODE_MODE in ('reencode', 'cap'):
-        preset = X264_PRESET if ENCODE_MODE == 'reencode' else 'ultrafast'
-        return [
-            '-c:v', 'libx264', '-preset', preset, '-tune', 'zerolatency',
-            '-b:v', VIDEO_BITRATE, '-maxrate', VIDEO_BITRATE,
-            '-bufsize', '16000k', '-pix_fmt', 'yuv420p',
-            '-g', '60', '-keyint_min', '60',
-            '-c:a', 'aac', '-b:a', AUDIO_BITRATE, '-ar', '44100',
-        ]
-    return ['-c', 'copy']
-
-
-def _classify_stderr(tail):
-    lower = tail.lower()
-    if 'broken pipe' in lower or 'connection timed out' in lower:
-        return 'youtube_disconnect'
-    return 'unknown'
-
-
-def _terminate_ffmpeg(proc):
-    """Ask ffmpeg to quit cleanly so YouTube sees a proper stream end."""
-    if proc is None or proc.poll() is not None:
-        return
-    if proc.stdin is not None:
-        try:
-            proc.stdin.write(b'q')
-            proc.stdin.flush()
-            proc.wait(timeout=15)
-            return
-        except Exception:
-            pass
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-
-
-def start_ffmpeg_stream(filename, stream_key, loop=False):
+def start_ffmpeg_stream(filename, stream_key):
     """
-    Loop mode: one long-lived ffmpeg with -stream_loop -1 (single RTMP session).
-      Python restarts every PLANNED_RESTART_SEC so timestamps never hit YouTube's
-      ~68 h limit — without reconnecting every time a short file ends.
+    Start a single ffmpeg pass (no -stream_loop).
 
-    Default ENCODE_MODE=cap re-encodes at 8 Mbps (low CPU, under YouTube's 13.5 Mbps cap).
-    Set ENCODE_MODE=copy for minimum CPU if source file is already compressed.
+    WHY NO -stream_loop:
+      Using -stream_loop -1 runs one ffmpeg process forever, causing timestamps
+      to accumulate indefinitely. After ~68 hours YouTube's RTMP ingest rejects
+      the stream and invalidates the key entirely (requires manual key regeneration).
+
+    SOLUTION — Python-level restart loop (see monitor_streams):
+      Each restart launches a fresh ffmpeg process with timestamps starting from 0.
+      This gives the same timestamp stability as a re-encoding approach (-c:v libx264)
+      but keeps CPU at near-zero because we still use -c copy.
+
+    FLAGS:
+      -re               : Read input at native frame rate (required for RTMP push).
+      -fflags +genpts   : Regenerate PTS from DTS if PTS is missing/invalid in source.
+      -avoid_negative_ts make_zero : Shift timestamps so the stream always starts at 0;
+                          guards against source files with a non-zero start offset.
+      -c copy           : No re-encoding — near-zero CPU on HuggingFace free tier.
+      -f flv            : FLV container required by YouTube RTMP ingest.
     """
     video_path = os.path.join(UPLOAD_FOLDER, filename)
     youtube_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
-    log_path = _log_path(stream_key)
-    log_file = open(log_path, 'a', encoding='utf-8', errors='replace')
 
-    command = ['ffmpeg', '-hide_banner', '-loglevel', 'warning']
-    command += _input_ts_args()
-    if loop:
-        command += ['-re', '-stream_loop', '-1', '-i', video_path]
-    else:
-        command += ['-re', '-i', video_path]
-    command += _output_args()
-    command += ['-flvflags', 'no_duration_filesize', '-f', 'flv', youtube_url]
+    command = [
+        'ffmpeg', '-re',
+        '-fflags', '+genpts',
+        '-avoid_negative_ts', 'make_zero',
+        '-i', video_path,
+        '-c', 'copy',
+        '-f', 'flv', youtube_url
+    ]
 
-    proc = subprocess.Popen(
-        command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=log_file
-    )
-    return proc, log_file
+    # stderr=DEVNULL keeps stream keys out of logs
+    return subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _backoff_delay(failures):
-    if failures <= 0:
-        return 0
-    return min(BACKOFF_BASE_SEC * (2 ** (failures - 1)), BACKOFF_MAX_SEC)
-
-
-def _log_ffmpeg_exit(key, info, exit_code, planned=False, disconnect_kind=None):
-    _close_log_file(info)
-    tail = _tail_file(_log_path(key))
-    runtime = time.time() - info.get('started_at', time.time())
-    kind = 'planned restart' if planned else 'exit'
-    logger.warning(
-        "ffmpeg %s: key=...%s file=%s code=%d runtime=%.0fs failures=%d%s",
-        kind, key[-5:], info['filename'], exit_code, runtime,
-        info.get('consecutive_failures', 0),
-        f" ({disconnect_kind})" if disconnect_kind else '',
-    )
-    if tail:
-        logger.warning("ffmpeg stderr (last lines) for key=...%s:\n%s", key[-5:], tail)
-    if disconnect_kind == 'youtube_disconnect' and info.get('consecutive_failures', 0) >= 3:
-        logger.error(
-            "YouTube likely ended the broadcast (key=...%s). "
-            "Open YouTube Studio → Go Live on your scheduled stream, then restart here. "
-            "If reconnects keep failing, regenerate the stream key.",
-            key[-5:],
-        )
-
-
-def _spawn_stream_locked(key, info):
-    """Must be called with streams_lock held. Reuses filename/loop on info."""
-    proc, log_file = start_ffmpeg_stream(info['filename'], key, loop=info['loop'])
-    info['process'] = proc
-    info['log_file'] = log_file
-    info['started_at'] = time.time()
-    info['planned_restart'] = False
-    info['next_restart_at'] = 0
-
-
-# ── Background monitor ─────────────────────────────────────────────────────────
+# Background monitor
 
 def monitor_streams():
-    consecutive_errors = 0
-
+    """
+    Polls every 3 seconds. When ffmpeg exits (file ended or crashed):
+      - loop=True  → restart immediately (Python-level infinite loop, fresh timestamps)
+      - loop=False → clean up the entry (play-once mode)
+    """
     while True:
         time.sleep(3)
-        try:
-            now = time.time()
-            with streams_lock:
-                for key in list(active_streams.keys()):
-                    info = active_streams[key]
-                    proc = info.get('process')
-
-                    # Proactive restart before timestamp overflow (loop mode only).
-                    if (
-                        proc is not None
-                        and info['loop']
-                        and proc.poll() is None
-                        and now - info.get('started_at', now) >= PLANNED_RESTART_SEC
-                    ):
-                        logger.info(
-                            "Planned restart for key=...%s after %ds",
-                            key[-5:], PLANNED_RESTART_SEC
-                        )
-                        info['planned_restart'] = True
-                        _terminate_ffmpeg(proc)
-
-                    if proc is None or proc.poll() is None:
-                        continue
-
-                    exit_code = proc.returncode
-                    planned = info.pop('planned_restart', False)
-                    runtime = now - info.get('started_at', now)
-                    stderr_tail = _tail_file(_log_path(key))
-                    disconnect_kind = None if planned else _classify_stderr(stderr_tail)
-
-                    if planned:
-                        info['consecutive_failures'] = 0
-                    elif runtime >= PLANNED_RESTART_SEC * 0.75:
-                        # Ran long enough; YouTube closed the socket — not an ffmpeg fault.
-                        info['consecutive_failures'] = 0
-                    elif disconnect_kind == 'youtube_disconnect' and runtime >= MIN_HEALTHY_RUNTIME_SEC:
-                        info['consecutive_failures'] = 0
-                    elif exit_code != 0 or runtime < MIN_HEALTHY_RUNTIME_SEC:
-                        info['consecutive_failures'] = info.get('consecutive_failures', 0) + 1
-                    else:
-                        info['consecutive_failures'] = 0
-
-                    _log_ffmpeg_exit(
-                        key, info, exit_code, planned=planned, disconnect_kind=disconnect_kind
-                    )
-
+        with streams_lock:
+            for key in list(active_streams.keys()):
+                info = active_streams[key]
+                if info['process'].poll() is not None:          # ffmpeg has exited
                     if info['loop']:
-                        failures = info['consecutive_failures']
-                        if failures == 0 and disconnect_kind == 'youtube_disconnect':
-                            delay = YOUTUBE_RECONNECT_SEC
-                        else:
-                            delay = _backoff_delay(failures)
-                        if delay:
-                            logger.info(
-                                "Backoff %ds before restart (key=...%s, failures=%d)",
-                                delay, key[-5:], info['consecutive_failures']
-                            )
-                        info['next_restart_at'] = now + delay
-                        info['process'] = None
+                        # Restart with a brand-new process → timestamps reset to 0
+                        active_streams[key]['process'] = start_ffmpeg_stream(
+                            info['filename'], key
+                        )
                     else:
+                        # Play-once mode: stream finished, remove entry
                         del active_streams[key]
+                        # Save outside lock to avoid potential deadlock
                         threading.Thread(target=save_all_states, daemon=True).start()
 
-                # Start streams whose backoff window has elapsed.
-                for key in list(active_streams.keys()):
-                    info = active_streams[key]
-                    if not info['loop'] or info.get('process') is not None:
-                        continue
-                    if now < info.get('next_restart_at', 0):
-                        continue
-                    logger.info("Restarting stream key=...%s file=%s", key[-5:], info['filename'])
-                    _spawn_stream_locked(key, info)
 
-            consecutive_errors = 0
-
-        except Exception:
-            consecutive_errors += 1
-            logger.exception(
-                "monitor_streams iteration error #%d — will retry in 3 s",
-                consecutive_errors
-            )
-
-
-def start_monitor():
-    global monitor_thread
-    monitor_thread = threading.Thread(target=monitor_streams, daemon=True, name='monitor')
-    monitor_thread.start()
-    logger.info("monitor_streams thread started (id=%d)", monitor_thread.ident)
-
-
-def watchdog():
-    while True:
-        time.sleep(30)
-        if monitor_thread is None or not monitor_thread.is_alive():
-            logger.critical("monitor_streams thread is dead — restarting it now")
-            start_monitor()
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# Routes
 
 @app.route('/')
 def index():
@@ -317,15 +121,13 @@ def index():
 
 @app.route('/health')
 def health():
+    """
+    Uptime endpoint. Point UptimeRobot (or any free monitor) here every 5 minutes
+    to prevent the HuggingFace Space from going to sleep and killing your stream.
+    """
     with streams_lock:
         count = len(active_streams)
-    return jsonify({
-        'status': 'ok',
-        'active_streams': count,
-        'monitor_alive': monitor_thread is not None and monitor_thread.is_alive(),
-        'planned_restart_hours': PLANNED_RESTART_SEC / 3600,
-        'encode_mode': ENCODE_MODE,
-    })
+    return jsonify({'status': 'ok', 'active_streams': count})
 
 
 @app.route('/upload', methods=['POST'])
@@ -378,23 +180,15 @@ def start_stream():
         return redirect(url_for('index'))
 
     with streams_lock:
+        # Stop any existing stream for this key before replacing
         if stream_key in active_streams:
-            _stop_stream_internal(stream_key)
+            active_streams[stream_key]['process'].terminate()
+            del active_streams[stream_key]
 
-        proc, log_file = start_ffmpeg_stream(filename, stream_key, loop=loop)
-        active_streams[stream_key] = {
-            'process': proc,
-            'filename': filename,
-            'loop': loop,
-            'log_file': log_file,
-            'started_at': time.time(),
-            'consecutive_failures': 0,
-            'next_restart_at': 0,
-            'planned_restart': False,
-        }
+        proc = start_ffmpeg_stream(filename, stream_key)
+        active_streams[stream_key] = {'process': proc, 'filename': filename, 'loop': loop}
 
     save_all_states()
-    logger.info("Stream started: key=...%s file=%s loop=%s", stream_key[-5:], filename, loop)
     flash(f'Stream started: {filename} (loop={loop})', 'success')
     return redirect(url_for('index'))
 
@@ -402,8 +196,7 @@ def start_stream():
 def _stop_stream_internal(key):
     """Must be called with streams_lock held."""
     if key in active_streams:
-        _terminate_ffmpeg(active_streams[key].get('process'))
-        _close_log_file(active_streams[key])
+        active_streams[key]['process'].terminate()
         del active_streams[key]
         return True
     return False
@@ -415,43 +208,27 @@ def stop_stream(key):
         stopped = _stop_stream_internal(key)
     if stopped:
         save_all_states()
-        logger.info("Stream stopped: key=...%s", key[-5:])
         flash('Stream stopped', 'info')
     else:
         flash('Stream not found', 'warning')
     return redirect(url_for('index'))
 
 
-# ── Startup ────────────────────────────────────────────────────────────────────
+# Startup: auto-restore previously running streams
 
 saved_data = load_all_states()
 for key, info in saved_data.items():
     video_path = os.path.join(UPLOAD_FOLDER, info['filename'])
     if os.path.exists(video_path):
-        proc, log_file = start_ffmpeg_stream(info['filename'], key, loop=info['loop'])
+        proc = start_ffmpeg_stream(info['filename'], key)
         active_streams[key] = {
             'process': proc,
             'filename': info['filename'],
-            'loop': info['loop'],
-            'log_file': log_file,
-            'started_at': time.time(),
-            'consecutive_failures': 0,
-            'next_restart_at': 0,
-            'planned_restart': False,
+            'loop': info['loop']
         }
-        logger.info("Auto-restored stream: key=...%s file=%s", key[-5:], info['filename'])
-    else:
-        logger.warning(
-            "Skipping auto-restore for key=...%s: file '%s' not found",
-            key[-5:], info['filename']
-        )
 
-start_monitor()
-threading.Thread(target=watchdog, daemon=True, name='watchdog').start()
-logger.info(
-    "Encode mode: %s | planned restart every %.1fh | video bitrate %s",
-    ENCODE_MODE, PLANNED_RESTART_SEC / 3600, VIDEO_BITRATE,
-)
+threading.Thread(target=monitor_streams, daemon=True).start()
 
 if __name__ == '__main__':
+    # Port 7860 is required by Hugging Face Spaces
     app.run(host='0.0.0.0', port=7860, debug=False)
